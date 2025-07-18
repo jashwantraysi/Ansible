@@ -1,0 +1,259 @@
+---
+- name: Prepare Kubernetes nodes (Master & Workers)
+  hosts: master,workers
+  become: yes
+  tasks:
+    - name: Gather system facts
+      setup:
+        gather_subset:
+          - os_family
+          - distribution
+          - kernel
+
+    - name: Set package manager
+      set_fact:
+        pkg_mgr: "{{ 'apt' if ansible_os_family == 'Debian' else 'dnf' }}"
+
+    - name: Install kernel modules package (Debian)
+      apt:
+        name: "linux-modules-extra-{{ ansible_kernel }}"
+        state: present
+      when: pkg_mgr == 'apt'
+
+    - name: Install kernel modules package (RHEL/CentOS)
+      dnf:
+        name: kernel-modules-extra
+        state: present
+        disablerepo: kubernetes
+      when: pkg_mgr == 'dnf'
+
+    - name: Check and load overlay module
+      shell: modinfo overlay
+      register: overlay_mod
+      failed_when: false
+      changed_when: false
+
+    - name: Load overlay if available
+      command: modprobe overlay
+      when: overlay_mod.rc == 0
+
+    - name: Check and load br_netfilter module
+      shell: modinfo br_netfilter
+      register: br_netfilter_mod
+      failed_when: false
+      changed_when: false
+
+    - name: Load br_netfilter if available
+      command: modprobe br_netfilter
+      when: br_netfilter_mod.rc == 0
+
+    - name: Write module config
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Apply sysctl settings
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Reload sysctl
+      command: sysctl --system
+
+    - name: Disable SELinux (RHEL only)
+      when: ansible_os_family == "RedHat"
+      block:
+        - name: Disable SELinux in config
+          lineinfile:
+            path: /etc/selinux/config
+            regexp: '^SELINUX='
+            line: 'SELINUX=disabled'
+
+        - name: Set SELinux permissive
+          command: setenforce 0
+          ignore_errors: true
+
+    - name: Disable swap
+      command: swapoff -a
+      when: ansible_swaptotal_mb > 0
+
+    - name: Remove swap from fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].* swap .*)$'
+        replace: '# \1'
+
+    - name: Check if firewalld is installed
+      command: systemctl status firewalld
+      register: firewalld_check
+      failed_when: false
+      changed_when: false
+
+    - name: Disable firewalld if installed
+      service:
+        name: firewalld
+        enabled: false
+        state: stopped
+      when: "'Loaded' in firewalld_check.stdout"
+
+    - name: Add containerd repo for RHEL
+      when: pkg_mgr == 'dnf'
+      yum_repository:
+        name: docker-ce-stable
+        description: Docker CE Stable Repo
+        baseurl: https://download.docker.com/linux/centos/7/$basearch/stable
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+
+    - name: Install containerd on RHEL
+      dnf:
+        name: containerd.io
+        state: present
+        disablerepo: kubernetes
+      when: pkg_mgr == 'dnf'
+
+    - name: Install containerd on Debian
+      when: pkg_mgr == 'apt'
+      apt:
+        name: containerd
+        state: present
+        update_cache: yes
+
+    - name: Check if containerd config exists and is non-empty
+      stat:
+        path: /etc/containerd/config.toml
+      register: containerd_config
+
+    - name: Generate containerd config with full path
+      become: true
+      shell: >
+        /bin/containerd config default > /etc/containerd/config.toml
+      args:
+        executable: /bin/bash
+
+    - name: Set SystemdCgroup = true in containerd config
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: '^(\s*)SystemdCgroup\s*=\s*false'
+        replace: "\\1SystemdCgroup = true"
+
+    - name: Enable containerd to start on boot
+      systemd:
+        name: containerd
+        enabled: true
+        state: started
+
+    - name: Reboot nodes after containerd config change
+      reboot:
+        msg: "Reboot initiated by Ansible after containerd config update"
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        reboot_timeout: 600
+
+    - name: Add Kubernetes repo (Debian)
+      when: pkg_mgr == 'apt'
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key | gpg --dearmour -o /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
+        apt-get update
+      args:
+        executable: /bin/bash
+
+    - name: Add Kubernetes repo (RHEL/CentOS)
+      when: pkg_mgr in ['dnf', 'yum']
+      yum_repository:
+        name: kubernetes
+        description: Kubernetes Official Repo
+        baseurl: https://pkgs.k8s.io/core:/stable:/v1.32/rpm/
+        gpgcheck: yes
+        repo_gpgcheck: yes
+        gpgkey:
+          - https://pkgs.k8s.io/core:/stable:/v1.32/rpm/repodata/repomd.xml.key
+        enabled: yes
+        exclude: kubelet kubeadm kubectl cri-tools kubernetes-cni
+
+    - name: Clean YUM cache
+      when: pkg_mgr in ['dnf', 'yum']
+      command: yum clean all
+
+    - name: Install Kubernetes packages with disableexcludes
+      when: pkg_mgr in ['dnf', 'yum']
+      command: >
+        {{ pkg_mgr }} install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+
+    - name: Enable and start kubelet
+      systemd:
+        name: kubelet
+        enabled: true
+        state: started
+
+# --------------------------------------------------------
+- name: Initialize Kubernetes Master
+  hosts: master
+  become: yes
+  tasks:
+
+    - name: Run kubeadm init
+      command: kubeadm init --pod-network-cidr=10.244.0.0/16
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Pull Kubernetes control plane images
+      command: kubeadm config images pull
+
+    - name: Ensure .kube directory exists for root
+      file:
+        path: /root/.kube
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Copy admin.conf as root's kubeconfig
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        remote_src: yes
+        owner: root
+        group: root
+        mode: '0644'
+
+#---------------------------------------------------------
+- name: Install Calico CNI for Kubernetes
+  hosts: master
+  become: yes
+  tasks:
+
+    - name: Apply tigera-operator manifest from remote URL
+      shell: |
+        kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/tigera-operator.yaml
+
+    - name: Download custom-resources.yaml
+      shell: curl -O https://raw.githubusercontent.com/projectcalico/calico/v3.26.1/manifests/custom-resources.yaml
+
+    - name: Update Pod CIDR in custom-resources.yaml
+      shell: "sed -i 's/cidr: 192\\.168\\.0\\.0\\/16/cidr: 10.244.0.0\\/16/g' custom-resources.yaml"
+
+    - name: Apply modified custom-resources.yaml
+      shell: kubectl create -f custom-resources.yaml
+
+#---------------------------------------------------------
+- name: Join Worker Nodes to Cluster
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Get join command from master
+      delegate_to: "{{ groups['master'][0] }}"
+      shell: kubeadm token create --print-join-command
+      register: joincmd
+
+    - name: Run kubeadm join
+      command: "{{ joincmd.stdout }}"
+
+#---------------------------------------------------------
